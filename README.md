@@ -1,6 +1,6 @@
 # mnist_cnn_risk
  
-A small convolutional neural network for MNIST digit recognition, written **from scratch in [Risk](#about-risk)**
+A small convolutional neural network for MNIST digit recognition, written from scratch in Risk.
 - **Train** on the 60,000 MNIST images and save the weights to a 24 KB binary file.
 - **Infer** interactively: draw a digit with your mouse in an X11 window and see the model's prediction and per-class probabilities.
 ## Repository layout
