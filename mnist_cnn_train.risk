@@ -1,0 +1,672 @@
+import "@core";
+
+extern "cblas.h" lib "openblas" {
+    func cblas_sgemm(
+        order: i32, transA: i32, transB: i32,
+        M: i32, N: i32, K: i32,
+        alpha: f32,
+        A: ptr<f32>, lda: i32,
+        B: ptr<f32>, ldb: i32,
+        beta: f32,
+        C: ptr<f32>, ldc: i32
+    ) -> void;
+}
+
+extern "math.h" lib "m" {
+    func expf(x: f32) -> f32;
+    func logf(x: f32) -> f32;
+}
+
+CBLAS_ROW_MAJOR: i32 = 101;
+CBLAS_NO_TRANS: i32 = 111;
+CBLAS_TRANS: i32 = 112;
+
+IMG: i32 = 28;
+INPUT_DIM: i32 = 784;
+
+C1_F: i32 = 8;    
+K1: i32 = 5;
+C1_OUT: i32 = 24; 
+C1_HW: i32 = 576;
+CKK1: i32 = 25;  
+POOL1_OUT: i32 = 12;
+POOL1_HW: i32 = 144; 
+
+C2_F: i32 = 16;   
+K2: i32 = 5;
+C2_OUT: i32 = 8; 
+C2_HW: i32 = 64; 
+CKK2: i32 = 200; 
+POOL2_OUT: i32 = 4;
+POOL2_HW: i32 = 16;
+
+FLATTEN: i32 = 256;
+OUTPUT_DIM: i32 = 10;
+
+BATCH: i32 = 32;
+TRAIN_N: i32 = 60000;
+TEST_N: i32 = 10000;
+
+train_images: Array<u8, 47040000>;
+train_labels: Array<u8, 60000>;
+test_images: Array<u8, 7840000>;
+test_labels: Array<u8, 10000>;
+
+W1: Array<f32, 200>;   
+b1: Array<f32, 8>;
+W2: Array<f32, 3200>; 
+b2: Array<f32, 16>;
+W3: Array<f32, 2560>;
+b3: Array<f32, 10>;
+
+dW1: Array<f32, 200>;
+db1: Array<f32, 8>;
+dW2: Array<f32, 3200>;
+db2: Array<f32, 16>;
+dW3: Array<f32, 2560>;
+db3: Array<f32, 10>;
+
+img_batch: Array<f32, 25088>;   
+
+col1: Array<f32, 460800>;      
+conv1_out: Array<f32, 147456>;    
+relu1_mask: Array<f32, 147456>;
+pool1_out: Array<f32, 36864>;     
+pool1_argmax: Array<i32, 36864>;
+
+col2: Array<f32, 409600>;         
+conv2_out: Array<f32, 32768>;     
+relu2_mask: Array<f32, 32768>;
+pool2_out: Array<f32, 8192>;    
+pool2_argmax: Array<i32, 8192>;
+
+logits: Array<f32, 320>;      
+probs: Array<f32, 320>;
+
+dlogits: Array<f32, 320>;
+dpool2: Array<f32, 8192>;
+dconv2_out: Array<f32, 32768>;
+dcol2: Array<f32, 409600>;
+dpool1_out: Array<f32, 36864>;
+dconv1_out: Array<f32, 147456>;
+
+func load_idx_images(path: string, buf: ptr<u8>, count: i32) -> i32 {
+    f: ptr<FILE> = fopen(path, "rb");
+    if (f == null) {
+        ioPrintln("Error: could not open '", path, "'");
+        exit(1);
+    }
+    header: Array<u8, 16> = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    fread(cast<ptr<void>>(&header[0]), 1, 16, f);
+    n_read: u64 = fread(cast<ptr<void>>(buf), 1, cast<u64>(count * INPUT_DIM), f);
+    fclose(f);
+    return cast<i32>(n_read);
+}
+
+func load_idx_labels(path: string, buf: ptr<u8>, count: i32) -> i32 {
+    f: ptr<FILE> = fopen(path, "rb");
+    if (f == null) {
+        ioPrintln("Error: could not open '", path, "'");
+        exit(1);
+    }
+    header: Array<u8, 8> = [0, 0, 0, 0, 0, 0, 0, 0];
+    fread(cast<ptr<void>>(&header[0]), 1, 8, f);
+    n_read: u64 = fread(cast<ptr<void>>(buf), 1, cast<u64>(count), f);
+    fclose(f);
+    return cast<i32>(n_read);
+}
+
+func rand_uniform(limit: f32) -> f32 {
+    r: f64 = randFloatRange(-1.0, 1.0);
+    return cast<f32>(r) * limit;
+}
+
+func init_weights() -> void {
+    limit1: f32 = cast<f32>(sqrt(6.0 / cast<f64>(CKK1 + C1_F * CKK1)));
+    i: i32 = 0;
+    while (i < 200) { W1[i] = rand_uniform(limit1); i = i + 1; }
+    i = 0;
+    while (i < C1_F) { b1[i] = cast<f32>(0.0); i = i + 1; }
+
+    limit2: f32 = cast<f32>(sqrt(6.0 / cast<f64>(CKK2 + C2_F * CKK2)));
+    i = 0;
+    while (i < 3200) { W2[i] = rand_uniform(limit2); i = i + 1; }
+    i = 0;
+    while (i < C2_F) { b2[i] = cast<f32>(0.0); i = i + 1; }
+
+    limit3: f32 = cast<f32>(sqrt(6.0 / cast<f64>(FLATTEN + OUTPUT_DIM)));
+    i = 0;
+    while (i < 2560) { W3[i] = rand_uniform(limit3); i = i + 1; }
+    i = 0;
+    while (i < OUTPUT_DIM) { b3[i] = cast<f32>(0.0); i = i + 1; }
+}
+
+func im2col_1(bsize: i32) -> void {
+    b: i32 = 0;
+    while (b < bsize) {
+        kh: i32 = 0;
+        while (kh < K1) {
+            kw: i32 = 0;
+            while (kw < K1) {
+                row: i32 = kh * K1 + kw;
+                oh: i32 = 0;
+                while (oh < C1_OUT) {
+                    ow: i32 = 0;
+                    while (ow < C1_OUT) {
+                        col_idx: i32 = b * C1_HW + oh * C1_OUT + ow;
+                        src: f32 = img_batch[b * INPUT_DIM + (oh + kh) * IMG + (ow + kw)];
+                        col1[row * (BATCH * C1_HW) + col_idx] = src;
+                        ow = ow + 1;
+                    }
+                    oh = oh + 1;
+                }
+                kw = kw + 1;
+            }
+            kh = kh + 1;
+        }
+        b = b + 1;
+    }
+}
+
+func im2col_2(bsize: i32) -> void {
+    b: i32 = 0;
+    while (b < bsize) {
+        c: i32 = 0;
+        while (c < C1_F) {
+            kh: i32 = 0;
+            while (kh < K2) {
+                kw: i32 = 0;
+                while (kw < K2) {
+                    row: i32 = c * (K2 * K2) + kh * K2 + kw;
+                    oh: i32 = 0;
+                    while (oh < C2_OUT) {
+                        ow: i32 = 0;
+                        while (ow < C2_OUT) {
+                            col_idx: i32 = b * C2_HW + oh * C2_OUT + ow;
+                            src: f32 = pool1_out[b * (C1_F * POOL1_HW) + c * POOL1_HW + (oh + kh) * POOL1_OUT + (ow + kw)];
+                            col2[row * (BATCH * C2_HW) + col_idx] = src;
+                            ow = ow + 1;
+                        }
+                        oh = oh + 1;
+                    }
+                    kw = kw + 1;
+                }
+                kh = kh + 1;
+            }
+            c = c + 1;
+        }
+        b = b + 1;
+    }
+}
+
+func relu_forward(buf: ptr<f32>, mask: ptr<f32>, n: i32) -> void {
+    i: i32 = 0;
+    while (i < n) {
+        v: f32 = buf[i];
+        if (v > cast<f32>(0.0)) {
+            mask[i] = cast<f32>(1.0);
+        } else {
+            buf[i] = cast<f32>(0.0);
+            mask[i] = cast<f32>(0.0);
+        }
+        i = i + 1;
+    }
+}
+
+func pool1_forward(bsize: i32) -> void {
+    b: i32 = 0;
+    while (b < bsize) {
+        f: i32 = 0;
+        while (f < C1_F) {
+            ph: i32 = 0;
+            while (ph < POOL1_OUT) {
+                pw: i32 = 0;
+                while (pw < POOL1_OUT) {
+                    base: i32 = f * (BATCH * C1_HW) + b * C1_HW;
+                    best_val: f32 = conv1_out[base + (2 * ph) * C1_OUT + (2 * pw)];
+                    best_idx: i32 = 0;
+                    dh: i32 = 0;
+                    while (dh < 2) {
+                        dw: i32 = 0;
+                        while (dw < 2) {
+                            idx: i32 = (2 * ph + dh) * C1_OUT + (2 * pw + dw);
+                            v: f32 = conv1_out[base + idx];
+                            if (v > best_val) {
+                                best_val = v;
+                                best_idx = dh * 2 + dw;
+                            }
+                            dw = dw + 1;
+                        }
+                        dh = dh + 1;
+                    }
+                    out_idx: i32 = b * (C1_F * POOL1_HW) + f * POOL1_HW + ph * POOL1_OUT + pw;
+                    pool1_out[out_idx] = best_val;
+                    pool1_argmax[out_idx] = best_idx;
+                    pw = pw + 1;
+                }
+                ph = ph + 1;
+            }
+            f = f + 1;
+        }
+        b = b + 1;
+    }
+}
+
+func pool2_forward(bsize: i32) -> void {
+    b: i32 = 0;
+    while (b < bsize) {
+        f: i32 = 0;
+        while (f < C2_F) {
+            ph: i32 = 0;
+            while (ph < POOL2_OUT) {
+                pw: i32 = 0;
+                while (pw < POOL2_OUT) {
+                    base: i32 = f * (BATCH * C2_HW) + b * C2_HW;
+                    best_val: f32 = conv2_out[base + (2 * ph) * C2_OUT + (2 * pw)];
+                    best_idx: i32 = 0;
+                    dh: i32 = 0;
+                    while (dh < 2) {
+                        dw: i32 = 0;
+                        while (dw < 2) {
+                            idx: i32 = (2 * ph + dh) * C2_OUT + (2 * pw + dw);
+                            v: f32 = conv2_out[base + idx];
+                            if (v > best_val) {
+                                best_val = v;
+                                best_idx = dh * 2 + dw;
+                            }
+                            dw = dw + 1;
+                        }
+                        dh = dh + 1;
+                    }
+                    out_idx: i32 = b * FLATTEN + f * POOL2_HW + ph * POOL2_OUT + pw;
+                    pool2_out[out_idx] = best_val;
+                    pool2_argmax[out_idx] = best_idx;
+                    pw = pw + 1;
+                }
+                ph = ph + 1;
+            }
+            f = f + 1;
+        }
+        b = b + 1;
+    }
+}
+
+func forward_batch(images: ptr<u8>, labels: ptr<u8>, offset: i32, bsize: i32) -> f32 {
+    b: i32 = 0;
+    while (b < bsize) {
+        p: i32 = 0;
+        while (p < INPUT_DIM) {
+            img_batch[b * INPUT_DIM + p] = cast<f32>(images[(offset + b) * INPUT_DIM + p]) / 255.0;
+            p = p + 1;
+        }
+        b = b + 1;
+    }
+
+    im2col_1(bsize);
+    cblas_sgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
+                C1_F, bsize * C1_HW, CKK1,
+                cast<f32>(1.0),
+                &W1[0], CKK1,
+                &col1[0], BATCH * C1_HW,
+                cast<f32>(0.0),
+                &conv1_out[0], BATCH * C1_HW);
+    f: i32 = 0;
+    while (f < C1_F) {
+        i: i32 = 0;
+        while (i < bsize * C1_HW) {
+            conv1_out[f * (BATCH * C1_HW) + i] = conv1_out[f * (BATCH * C1_HW) + i] + b1[f];
+            i = i + 1;
+        }
+        f = f + 1;
+    }
+    relu_forward(&conv1_out[0], &relu1_mask[0], C1_F * BATCH * C1_HW);
+    pool1_forward(bsize);
+
+    im2col_2(bsize);
+    cblas_sgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
+                C2_F, bsize * C2_HW, CKK2,
+                cast<f32>(1.0),
+                &W2[0], CKK2,
+                &col2[0], BATCH * C2_HW,
+                cast<f32>(0.0),
+                &conv2_out[0], BATCH * C2_HW);
+    f = 0;
+    while (f < C2_F) {
+        i: i32 = 0;
+        while (i < bsize * C2_HW) {
+            conv2_out[f * (BATCH * C2_HW) + i] = conv2_out[f * (BATCH * C2_HW) + i] + b2[f];
+            i = i + 1;
+        }
+        f = f + 1;
+    }
+    relu_forward(&conv2_out[0], &relu2_mask[0], C2_F * BATCH * C2_HW);
+    pool2_forward(bsize);
+
+    cblas_sgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
+                bsize, OUTPUT_DIM, FLATTEN,
+                cast<f32>(1.0),
+                &pool2_out[0], FLATTEN,
+                &W3[0], OUTPUT_DIM,
+                cast<f32>(0.0),
+                &logits[0], OUTPUT_DIM);
+
+    total_loss: f32 = cast<f32>(0.0);
+    b = 0;
+    while (b < bsize) {
+        j: i32 = 0;
+        while (j < OUTPUT_DIM) {
+            logits[b * OUTPUT_DIM + j] = logits[b * OUTPUT_DIM + j] + b3[j];
+            j = j + 1;
+        }
+        max_val: f32 = logits[b * OUTPUT_DIM + 0];
+        j = 1;
+        while (j < OUTPUT_DIM) {
+            v: f32 = logits[b * OUTPUT_DIM + j];
+            if (v > max_val) { max_val = v; }
+            j = j + 1;
+        }
+        sum_exp: f32 = cast<f32>(0.0);
+        j = 0;
+        while (j < OUTPUT_DIM) {
+            e: f32 = expf(logits[b * OUTPUT_DIM + j] - max_val);
+            probs[b * OUTPUT_DIM + j] = e;
+            sum_exp = sum_exp + e;
+            j = j + 1;
+        }
+        j = 0;
+        while (j < OUTPUT_DIM) {
+            probs[b * OUTPUT_DIM + j] = probs[b * OUTPUT_DIM + j] / sum_exp;
+            j = j + 1;
+        }
+        label: u8 = labels[offset + b];
+        correct_prob: f32 = probs[b * OUTPUT_DIM + cast<i32>(label)];
+        if (correct_prob < 0.0000001) {
+            correct_prob = cast<f32>(0.0000001);
+        }
+        total_loss = total_loss - logf(correct_prob);
+        b = b + 1;
+    }
+
+    return total_loss / cast<f32>(bsize);
+}
+
+func backward_batch(labels: ptr<u8>, offset: i32, bsize: i32) -> void {
+    inv_b: f32 = cast<f32>(1.0) / cast<f32>(bsize);
+    b: i32 = 0;
+    while (b < bsize) {
+        label: u8 = labels[offset + b];
+        j: i32 = 0;
+        while (j < OUTPUT_DIM) {
+            target: f32 = cast<f32>(0.0);
+            if (j == cast<i32>(label)) { target = cast<f32>(1.0); }
+            dlogits[b * OUTPUT_DIM + j] = (probs[b * OUTPUT_DIM + j] - target) * inv_b;
+            j = j + 1;
+        }
+        b = b + 1;
+    }
+
+    // dW3 (256 x 10) = pool2_out^T (256 x bsize) @ dlogits (bsize x 10)
+    cblas_sgemm(CBLAS_ROW_MAJOR, CBLAS_TRANS, CBLAS_NO_TRANS,
+                FLATTEN, OUTPUT_DIM, bsize,
+                cast<f32>(1.0),
+                &pool2_out[0], FLATTEN,
+                &dlogits[0], OUTPUT_DIM,
+                cast<f32>(0.0),
+                &dW3[0], OUTPUT_DIM);
+    j: i32 = 0;
+    while (j < OUTPUT_DIM) {
+        s: f32 = cast<f32>(0.0);
+        b = 0;
+        while (b < bsize) { s = s + dlogits[b * OUTPUT_DIM + j]; b = b + 1; }
+        db3[j] = s;
+        j = j + 1;
+    }
+
+    cblas_sgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_TRANS,
+                bsize, FLATTEN, OUTPUT_DIM,
+                cast<f32>(1.0),
+                &dlogits[0], OUTPUT_DIM,
+                &W3[0], OUTPUT_DIM,
+                cast<f32>(0.0),
+                &dpool2[0], FLATTEN);
+
+    i: i32 = 0;
+    while (i < C2_F * BATCH * C2_HW) { dconv2_out[i] = cast<f32>(0.0); i = i + 1; }
+    b = 0;
+    while (b < bsize) {
+        f: i32 = 0;
+        while (f < C2_F) {
+            ph: i32 = 0;
+            while (ph < POOL2_OUT) {
+                pw: i32 = 0;
+                while (pw < POOL2_OUT) {
+                    src_idx: i32 = b * FLATTEN + f * POOL2_HW + ph * POOL2_OUT + pw;
+                    amax: i32 = pool2_argmax[src_idx];
+                    dh: i32 = amax / 2;
+                    dw: i32 = amax % 2;
+                    base: i32 = f * (BATCH * C2_HW) + b * C2_HW;
+                    dst_idx: i32 = base + (2 * ph + dh) * C2_OUT + (2 * pw + dw);
+                    dconv2_out[dst_idx] = dconv2_out[dst_idx] + dpool2[src_idx];
+                    pw = pw + 1;
+                }
+                ph = ph + 1;
+            }
+            f = f + 1;
+        }
+        b = b + 1;
+    }
+
+    i = 0;
+    while (i < C2_F * BATCH * C2_HW) {
+        dconv2_out[i] = dconv2_out[i] * relu2_mask[i];
+        i = i + 1;
+    }
+
+    cblas_sgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_TRANS,
+                C2_F, CKK2, bsize * C2_HW,
+                cast<f32>(1.0),
+                &dconv2_out[0], BATCH * C2_HW,
+                &col2[0], BATCH * C2_HW,
+                cast<f32>(0.0),
+                &dW2[0], CKK2);
+    f: i32 = 0;
+    while (f < C2_F) {
+        s: f32 = cast<f32>(0.0);
+        i = 0;
+        while (i < bsize * C2_HW) { s = s + dconv2_out[f * (BATCH * C2_HW) + i]; i = i + 1; }
+        db2[f] = s;
+        f = f + 1;
+    }
+
+    cblas_sgemm(CBLAS_ROW_MAJOR, CBLAS_TRANS, CBLAS_NO_TRANS,
+                CKK2, bsize * C2_HW, C2_F,
+                cast<f32>(1.0),
+                &W2[0], CKK2,
+                &dconv2_out[0], BATCH * C2_HW,
+                cast<f32>(0.0),
+                &dcol2[0], BATCH * C2_HW);
+
+    i = 0;
+    while (i < BATCH * C1_F * POOL1_HW) { dpool1_out[i] = cast<f32>(0.0); i = i + 1; }
+    b = 0;
+    while (b < bsize) {
+        c: i32 = 0;
+        while (c < C1_F) {
+            kh: i32 = 0;
+            while (kh < K2) {
+                kw: i32 = 0;
+                while (kw < K2) {
+                    row: i32 = c * (K2 * K2) + kh * K2 + kw;
+                    oh: i32 = 0;
+                    while (oh < C2_OUT) {
+                        ow: i32 = 0;
+                        while (ow < C2_OUT) {
+                            col_idx: i32 = b * C2_HW + oh * C2_OUT + ow;
+                            dst: i32 = b * (C1_F * POOL1_HW) + c * POOL1_HW + (oh + kh) * POOL1_OUT + (ow + kw);
+                            dpool1_out[dst] = dpool1_out[dst] + dcol2[row * (BATCH * C2_HW) + col_idx];
+                            ow = ow + 1;
+                        }
+                        oh = oh + 1;
+                    }
+                    kw = kw + 1;
+                }
+                kh = kh + 1;
+            }
+            c = c + 1;
+        }
+        b = b + 1;
+    }
+
+    i = 0;
+    while (i < C1_F * BATCH * C1_HW) { dconv1_out[i] = cast<f32>(0.0); i = i + 1; }
+    b = 0;
+    while (b < bsize) {
+        f: i32 = 0;
+        while (f < C1_F) {
+            ph: i32 = 0;
+            while (ph < POOL1_OUT) {
+                pw: i32 = 0;
+                while (pw < POOL1_OUT) {
+                    src_idx: i32 = b * (C1_F * POOL1_HW) + f * POOL1_HW + ph * POOL1_OUT + pw;
+                    amax: i32 = pool1_argmax[src_idx];
+                    dh: i32 = amax / 2;
+                    dw: i32 = amax % 2;
+                    base: i32 = f * (BATCH * C1_HW) + b * C1_HW;
+                    dst_idx: i32 = base + (2 * ph + dh) * C1_OUT + (2 * pw + dw);
+                    dconv1_out[dst_idx] = dconv1_out[dst_idx] + dpool1_out[src_idx];
+                    pw = pw + 1;
+                }
+                ph = ph + 1;
+            }
+            f = f + 1;
+        }
+        b = b + 1;
+    }
+
+    i = 0;
+    while (i < C1_F * BATCH * C1_HW) {
+        dconv1_out[i] = dconv1_out[i] * relu1_mask[i];
+        i = i + 1;
+    }
+
+    cblas_sgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_TRANS,
+                C1_F, CKK1, bsize * C1_HW,
+                cast<f32>(1.0),
+                &dconv1_out[0], BATCH * C1_HW,
+                &col1[0], BATCH * C1_HW,
+                cast<f32>(0.0),
+                &dW1[0], CKK1);
+    f = 0;
+    while (f < C1_F) {
+        s: f32 = cast<f32>(0.0);
+        i = 0;
+        while (i < bsize * C1_HW) { s = s + dconv1_out[f * (BATCH * C1_HW) + i]; i = i + 1; }
+        db1[f] = s;
+        f = f + 1;
+    }
+}
+
+func sgd_step(lr: f32) -> void {
+    i: i32 = 0;
+    while (i < 200) { W1[i] = W1[i] - lr * dW1[i]; i = i + 1; }
+    i = 0;
+    while (i < C1_F) { b1[i] = b1[i] - lr * db1[i]; i = i + 1; }
+    i = 0;
+    while (i < 3200) { W2[i] = W2[i] - lr * dW2[i]; i = i + 1; }
+    i = 0;
+    while (i < C2_F) { b2[i] = b2[i] - lr * db2[i]; i = i + 1; }
+    i = 0;
+    while (i < 2560) { W3[i] = W3[i] - lr * dW3[i]; i = i + 1; }
+    i = 0;
+    while (i < OUTPUT_DIM) { b3[i] = b3[i] - lr * db3[i]; i = i + 1; }
+}
+
+func argmax_row(row: i32) -> i32 {
+    best: i32 = 0;
+    best_val: f32 = probs[row * OUTPUT_DIM + 0];
+    j: i32 = 1;
+    while (j < OUTPUT_DIM) {
+        v: f32 = probs[row * OUTPUT_DIM + j];
+        if (v > best_val) { best_val = v; best = j; }
+        j = j + 1;
+    }
+    return best;
+}
+
+func evaluate(n: i32) -> f32 {
+    correct: i32 = 0;
+    offset: i32 = 0;
+    while (offset < n) {
+        bsize: i32 = BATCH;
+        if (offset + bsize > n) { bsize = n - offset; }
+        forward_batch(&test_images[0], &test_labels[0], offset, bsize);
+        b: i32 = 0;
+        while (b < bsize) {
+            pred: i32 = argmax_row(b);
+            actual: u8 = test_labels[offset + b];
+            if (pred == cast<i32>(actual)) { correct = correct + 1; }
+            b = b + 1;
+        }
+        offset = offset + bsize;
+    }
+    return cast<f32>(correct) / cast<f32>(n);
+}
+
+func save_weights(path: string) -> void {
+    total: u64 = 23976;
+    buf: ptr<u8> = cast<ptr<u8>>(alloc(total));
+    copyMemory(cast<ptr<void>>(buf), cast<ptr<void>>(&W1[0]), 800);
+    copyMemory(cast<ptr<void>>(buf + 800), cast<ptr<void>>(&b1[0]), 32);
+    copyMemory(cast<ptr<void>>(buf + 832), cast<ptr<void>>(&W2[0]), 12800);
+    copyMemory(cast<ptr<void>>(buf + 13632), cast<ptr<void>>(&b2[0]), 64);
+    copyMemory(cast<ptr<void>>(buf + 13696), cast<ptr<void>>(&W3[0]), 10240);
+    copyMemory(cast<ptr<void>>(buf + 23936), cast<ptr<void>>(&b3[0]), 40);
+    n: i64 = fioBytesWrite(path, cast<ptr<void>>(buf), total);
+    if (n != cast<i64>(total)) {
+        ioPrintln("Error: failed to write weights to ", path);
+    } else {
+        ioPrintln("Saved weights to ", path);
+    }
+    dealloc(buf);
+}
+
+func main() -> i32 {
+    ioPrintln("Loading MNIST...");
+    load_idx_images("mnist_data/train-images-idx3-ubyte", &train_images[0], TRAIN_N);
+    load_idx_labels("mnist_data/train-labels-idx1-ubyte", &train_labels[0], TRAIN_N);
+    load_idx_images("mnist_data/t10k-images-idx3-ubyte", &test_images[0], TEST_N);
+    load_idx_labels("mnist_data/t10k-labels-idx1-ubyte", &test_labels[0], TEST_N);
+    ioPrintln("Loaded.");
+
+    init_weights();
+
+    epochs: i32 = 3;
+    lr: f32 = cast<f32>(0.1);
+
+    e: i32 = 0;
+    while (e < epochs) {
+        offset: i32 = 0;
+        step: i32 = 0;
+        running_loss: f32 = cast<f32>(0.0);
+        while (offset + BATCH <= TRAIN_N) {
+            loss: f32 = forward_batch(&train_images[0], &train_labels[0], offset, BATCH);
+            backward_batch(&train_labels[0], offset, BATCH);
+            sgd_step(lr);
+
+            running_loss = running_loss + loss;
+            step = step + 1;
+            if (step % 200 == 0) {
+                ioPrintln("epoch ", e, " step ", step, " loss ", running_loss / cast<f32>(200.0));
+                running_loss = cast<f32>(0.0);
+            }
+            offset = offset + BATCH;
+        }
+
+        acc: f32 = evaluate(TEST_N);
+        ioPrintln("epoch ", e, " test accuracy: ", acc);
+        e = e + 1;
+    }
+
+    save_weights("cnn_weights.bin");
+    return 0;
+}

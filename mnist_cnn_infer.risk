@@ -1,0 +1,556 @@
+import "@core";
+
+extern "cblas.h" lib "openblas" {
+    func cblas_sgemm(
+        order: i32, transA: i32, transB: i32,
+        M: i32, N: i32, K: i32,
+        alpha: f32,
+        A: ptr<f32>, lda: i32,
+        B: ptr<f32>, ldb: i32,
+        beta: f32,
+        C: ptr<f32>, ldc: i32
+    ) -> void;
+}
+
+extern "math.h" lib "m" {
+    func expf(x: f32) -> f32;
+}
+
+extern "X11/Xlib.h" lib "X11" {
+    block Display "Display";
+    block GC "GC";
+
+    block XEvent "union _XEvent" {
+        type: i32;
+    }
+    block XButtonEvent "XButtonEvent" {
+        type: i32;
+        x: i32;
+        y: i32;
+    }
+    block XMotionEvent "XMotionEvent" {
+        type: i32;
+        x: i32;
+        y: i32;
+    }
+    block XKeyEvent "XKeyEvent" {
+        type: i32;
+    }
+
+    func XOpenDisplay(name: ptr<u8>) -> ptr<Display>;
+    func XDefaultScreen(display: ptr<Display>) -> i32;
+    func XRootWindow(display: ptr<Display>, screen: i32) -> u64;
+    func XBlackPixel(display: ptr<Display>, screen: i32) -> u64;
+    func XCreateSimpleWindow(display: ptr<Display>, parent: u64, x: i32, y: i32,
+                              width: u32, height: u32, border_width: u32,
+                              border: u64, background: u64) -> u64;
+    func XStoreName(display: ptr<Display>, w: u64, window_name: string) -> i32;
+    func XSelectInput(display: ptr<Display>, w: u64, event_mask: i64) -> i32;
+    func XInternAtom(display: ptr<Display>, atom_name: string, only_if_exists: i32) -> u64;
+    func XSetWMProtocols(display: ptr<Display>, w: u64, protocols: ptr<u64>, count: i32) -> i32;
+    func XCreateGC(display: ptr<Display>, d: u64, valuemask: u64, values: ptr<void>) -> GC;
+    func XMapWindow(display: ptr<Display>, w: u64) -> i32;
+    func XNextEvent(display: ptr<Display>, event_return: ptr<XEvent>) -> i32;
+    func XSetForeground(display: ptr<Display>, gc: GC, foreground: u64) -> i32;
+    func XFillRectangle(display: ptr<Display>, d: u64, gc: GC, x: i32, y: i32, width: u32, height: u32) -> i32;
+    func XDrawLine(display: ptr<Display>, d: u64, gc: GC, x1: i32, y1: i32, x2: i32, y2: i32) -> i32;
+    func XFlush(display: ptr<Display>) -> i32;
+    func XLookupKeysym(key_event: ptr<XKeyEvent>, index: i32) -> u64;
+    func XDestroyWindow(display: ptr<Display>, w: u64) -> i32;
+    func XCloseDisplay(display: ptr<Display>) -> i32;
+    func XFreeGC(display: ptr<Display>, gc: GC) -> i32;
+}
+
+IMG: i32 = 28;
+INPUT_DIM: i32 = 784;
+
+C1_F: i32 = 8;
+K1: i32 = 5;
+C1_OUT: i32 = 24;
+C1_HW: i32 = 576;
+CKK1: i32 = 25;
+POOL1_OUT: i32 = 12;
+POOL1_HW: i32 = 144;
+
+C2_F: i32 = 16;
+K2: i32 = 5;
+C2_OUT: i32 = 8;
+C2_HW: i32 = 64;
+CKK2: i32 = 200;
+POOL2_OUT: i32 = 4;
+POOL2_HW: i32 = 16;
+
+FLATTEN: i32 = 256;
+OUTPUT_DIM: i32 = 10;
+
+CBLAS_ROW_MAJOR: i32 = 101;
+CBLAS_NO_TRANS: i32 = 111;
+CBLAS_TRANS: i32 = 112;
+
+CELL: i32 = 10;
+GRID: i32 = 28;
+WIN_SIZE: i32 = 280;
+
+EVT_KEY_PRESS: i32 = 2;
+EVT_BUTTON_PRESS: i32 = 4;
+EVT_BUTTON_RELEASE: i32 = 5;
+EVT_MOTION_NOTIFY: i32 = 6;
+EVT_EXPOSE: i32 = 12;
+EVT_CLIENT_MESSAGE: i32 = 33;
+
+XK_RETURN: u64 = 65293;
+XK_KP_ENTER: u64 = 65421;
+XK_ESCAPE: u64 = 65307;
+XK_C_LOWER: u64 = 99;
+XK_C_UPPER: u64 = 67;
+
+W1: Array<f32, 200>;
+b1: Array<f32, 8>;
+W2: Array<f32, 3200>;
+b2: Array<f32, 16>;
+W3: Array<f32, 2560>;
+b3: Array<f32, 10>;
+
+drawn: Array<u8, 784>;
+preprocessed: Array<u8, 784>;
+
+img_f32: Array<f32, 784>;
+col1: Array<f32, 14400>;    
+conv1_out: Array<f32, 4608>; 
+relu1_mask: Array<f32, 4608>;
+pool1_out: Array<f32, 1152>; 
+pool1_argmax: Array<i32, 1152>;
+
+col2: Array<f32, 12800>;    
+conv2_out: Array<f32, 1024>;
+relu2_mask: Array<f32, 1024>;
+pool2_out: Array<f32, 256>;
+pool2_argmax: Array<i32, 256>;
+
+logits: Array<f32, 10>;
+probs: Array<f32, 10>;
+
+func load_weights(path: string) -> void {
+    total: u64 = 23976;
+    buf: ptr<u8> = cast<ptr<u8>>(alloc(total));
+    n: i64 = fioBytesRead(path, cast<ptr<void>>(buf), total);
+    if (n != cast<i64>(total)) {
+        ioPrintln("Error: could not read '", path, "' (run mnist_cnn_train first). Got ", n, " bytes, expected ", total);
+        return;
+    }
+    copyMemory(cast<ptr<void>>(&W1[0]), cast<ptr<void>>(buf), 800);
+    copyMemory(cast<ptr<void>>(&b1[0]), cast<ptr<void>>(buf + 800), 32);
+    copyMemory(cast<ptr<void>>(&W2[0]), cast<ptr<void>>(buf + 832), 12800);
+    copyMemory(cast<ptr<void>>(&b2[0]), cast<ptr<void>>(buf + 13632), 64);
+    copyMemory(cast<ptr<void>>(&W3[0]), cast<ptr<void>>(buf + 13696), 10240);
+    copyMemory(cast<ptr<void>>(&b3[0]), cast<ptr<void>>(buf + 23936), 40);
+    dealloc(buf);
+}
+
+func preprocess_digit() -> bool {
+    i: i32 = 0;
+    while (i < 784) {
+        preprocessed[i] = 0;
+        i = i + 1;
+    }
+
+    min_r: i32 = 28;
+    max_r: i32 = -1;
+    min_c: i32 = 28;
+    max_c: i32 = -1;
+    r: i32 = 0;
+    while (r < 28) {
+        c: i32 = 0;
+        while (c < 28) {
+            if (cast<i32>(drawn[r * 28 + c]) > 20) {
+                if (r < min_r) { min_r = r; }
+                if (r > max_r) { max_r = r; }
+                if (c < min_c) { min_c = c; }
+                if (c > max_c) { max_c = c; }
+            }
+            c = c + 1;
+        }
+        r = r + 1;
+    }
+
+    if (max_r < 0) {
+        return false;
+    }
+
+    bbox_h: i32 = max_r - min_r + 1;
+    bbox_w: i32 = max_c - min_c + 1;
+
+    target: f32 = cast<f32>(20.0);
+    scale: f32 = target / cast<f32>(bbox_h);
+    alt_scale: f32 = target / cast<f32>(bbox_w);
+    if (alt_scale < scale) {
+        scale = alt_scale;
+    }
+
+    new_h: i32 = cast<i32>(cast<f32>(bbox_h) * scale);
+    new_w: i32 = cast<i32>(cast<f32>(bbox_w) * scale);
+    if (new_h < 1) { new_h = 1; }
+    if (new_w < 1) { new_w = 1; }
+    if (new_h > 28) { new_h = 28; }
+    if (new_w > 28) { new_w = 28; }
+
+    offset_r: i32 = (28 - new_h) / 2;
+    offset_c: i32 = (28 - new_w) / 2;
+
+    dr: i32 = 0;
+    while (dr < new_h) {
+        dc: i32 = 0;
+        while (dc < new_w) {
+            src_r: i32 = min_r + cast<i32>(cast<f32>(dr) / scale);
+            src_c: i32 = min_c + cast<i32>(cast<f32>(dc) / scale);
+            if (src_r > max_r) { src_r = max_r; }
+            if (src_c > max_c) { src_c = max_c; }
+            preprocessed[(offset_r + dr) * 28 + (offset_c + dc)] = drawn[src_r * 28 + src_c];
+            dc = dc + 1;
+        }
+        dr = dr + 1;
+    }
+
+    return true;
+}
+
+func predict() -> i32 {
+    p: i32 = 0;
+    while (p < INPUT_DIM) {
+        img_f32[p] = cast<f32>(preprocessed[p]) / 255.0;
+        p = p + 1;
+    }
+
+    kh: i32 = 0;
+    while (kh < K1) {
+        kw: i32 = 0;
+        while (kw < K1) {
+            row: i32 = kh * K1 + kw;
+            oh: i32 = 0;
+            while (oh < C1_OUT) {
+                ow: i32 = 0;
+                while (ow < C1_OUT) {
+                    col1[row * C1_HW + oh * C1_OUT + ow] = img_f32[(oh + kh) * IMG + (ow + kw)];
+                    ow = ow + 1;
+                }
+                oh = oh + 1;
+            }
+            kw = kw + 1;
+        }
+        kh = kh + 1;
+    }
+
+    cblas_sgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
+                C1_F, C1_HW, CKK1,
+                cast<f32>(1.0),
+                &W1[0], CKK1,
+                &col1[0], C1_HW,
+                cast<f32>(0.0),
+                &conv1_out[0], C1_HW);
+
+    f: i32 = 0;
+    while (f < C1_F) {
+        i: i32 = 0;
+        while (i < C1_HW) {
+            v: f32 = conv1_out[f * C1_HW + i] + b1[f];
+            if (v > cast<f32>(0.0)) { conv1_out[f * C1_HW + i] = v; } else { conv1_out[f * C1_HW + i] = cast<f32>(0.0); }
+            i = i + 1;
+        }
+        f = f + 1;
+    }
+
+    f = 0;
+    while (f < C1_F) {
+        ph: i32 = 0;
+        while (ph < POOL1_OUT) {
+            pw: i32 = 0;
+            while (pw < POOL1_OUT) {
+                base: i32 = f * C1_HW;
+                best_val: f32 = conv1_out[base + (2 * ph) * C1_OUT + (2 * pw)];
+                dh: i32 = 0;
+                while (dh < 2) {
+                    dw: i32 = 0;
+                    while (dw < 2) {
+                        v: f32 = conv1_out[base + (2 * ph + dh) * C1_OUT + (2 * pw + dw)];
+                        if (v > best_val) { best_val = v; }
+                        dw = dw + 1;
+                    }
+                    dh = dh + 1;
+                }
+                pool1_out[f * POOL1_HW + ph * POOL1_OUT + pw] = best_val;
+                pw = pw + 1;
+            }
+            ph = ph + 1;
+        }
+        f = f + 1;
+    }
+
+    // im2col for conv2
+    c: i32 = 0;
+    while (c < C1_F) {
+        kh = 0;
+        while (kh < K2) {
+            kw: i32 = 0;
+            while (kw < K2) {
+                row: i32 = c * (K2 * K2) + kh * K2 + kw;
+                oh: i32 = 0;
+                while (oh < C2_OUT) {
+                    ow: i32 = 0;
+                    while (ow < C2_OUT) {
+                        col2[row * C2_HW + oh * C2_OUT + ow] = pool1_out[c * POOL1_HW + (oh + kh) * POOL1_OUT + (ow + kw)];
+                        ow = ow + 1;
+                    }
+                    oh = oh + 1;
+                }
+                kw = kw + 1;
+            }
+            kh = kh + 1;
+        }
+        c = c + 1;
+    }
+
+    cblas_sgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
+                C2_F, C2_HW, CKK2,
+                cast<f32>(1.0),
+                &W2[0], CKK2,
+                &col2[0], C2_HW,
+                cast<f32>(0.0),
+                &conv2_out[0], C2_HW);
+
+    f = 0;
+    while (f < C2_F) {
+        i: i32 = 0;
+        while (i < C2_HW) {
+            v: f32 = conv2_out[f * C2_HW + i] + b2[f];
+            if (v > cast<f32>(0.0)) { conv2_out[f * C2_HW + i] = v; } else { conv2_out[f * C2_HW + i] = cast<f32>(0.0); }
+            i = i + 1;
+        }
+        f = f + 1;
+    }
+    f = 0;
+    while (f < C2_F) {
+        ph: i32 = 0;
+        while (ph < POOL2_OUT) {
+            pw: i32 = 0;
+            while (pw < POOL2_OUT) {
+                base: i32 = f * C2_HW;
+                best_val: f32 = conv2_out[base + (2 * ph) * C2_OUT + (2 * pw)];
+                dh: i32 = 0;
+                while (dh < 2) {
+                    dw: i32 = 0;
+                    while (dw < 2) {
+                        v: f32 = conv2_out[base + (2 * ph + dh) * C2_OUT + (2 * pw + dw)];
+                        if (v > best_val) { best_val = v; }
+                        dw = dw + 1;
+                    }
+                    dh = dh + 1;
+                }
+                pool2_out[f * POOL2_HW + ph * POOL2_OUT + pw] = best_val;
+                pw = pw + 1;
+            }
+            ph = ph + 1;
+        }
+        f = f + 1;
+    }
+
+    cblas_sgemm(CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
+                1, OUTPUT_DIM, FLATTEN,
+                cast<f32>(1.0),
+                &pool2_out[0], FLATTEN,
+                &W3[0], OUTPUT_DIM,
+                cast<f32>(0.0),
+                &logits[0], OUTPUT_DIM);
+
+    j: i32 = 0;
+    while (j < OUTPUT_DIM) { logits[j] = logits[j] + b3[j]; j = j + 1; }
+
+    max_val: f32 = logits[0];
+    j = 1;
+    while (j < OUTPUT_DIM) { if (logits[j] > max_val) { max_val = logits[j]; } j = j + 1; }
+
+    sum_exp: f32 = cast<f32>(0.0);
+    j = 0;
+    while (j < OUTPUT_DIM) {
+        e: f32 = expf(logits[j] - max_val);
+        probs[j] = e;
+        sum_exp = sum_exp + e;
+        j = j + 1;
+    }
+
+    best: i32 = 0;
+    best_val: f32 = cast<f32>(0.0);
+    j = 0;
+    while (j < OUTPUT_DIM) {
+        p2: f32 = probs[j] / sum_exp;
+        probs[j] = p2;
+        if (p2 > best_val) { best_val = p2; best = j; }
+        j = j + 1;
+    }
+    return best;
+}
+
+func print_grid(g: ptr<u8>) -> void {
+    row: i32 = 0;
+    while (row < 28) {
+        col: i32 = 0;
+        while (col < 28) {
+            v: i32 = cast<i32>(g[row * 28 + col]);
+            ioPrint("\x1b[48;2;", v, ";", v, ";", v, "m  ");
+            col = col + 1;
+        }
+        ioPrintln("\x1b[0m");
+        row = row + 1;
+    }
+}
+
+func paint(cx: i32, cy: i32) -> void {
+    dxs: Array<i32, 9> = [0, -1, 1, 0, 0, -1, 1, -1, 1];
+    dys: Array<i32, 9> = [0, 0, 0, -1, 1, -1, -1, 1, 1];
+    amts: Array<i32, 9> = [220, 110, 110, 110, 110, 40, 40, 40, 40];
+    k: i32 = 0;
+    while (k < 9) {
+        x: i32 = cx + dxs[k];
+        y: i32 = cy + dys[k];
+        if (x >= 0 && x < GRID && y >= 0 && y < GRID) {
+            idx: i32 = y * GRID + x;
+            add: i32 = cast<i32>(drawn[idx]) + amts[k];
+            if (add > 255) { add = 255; }
+            drawn[idx] = cast<u8>(add);
+        }
+        k = k + 1;
+    }
+}
+
+func redraw(d: ptr<Display>, w: u64, gc: GC) -> void {
+    XSetForeground(d, gc, 0);
+    XFillRectangle(d, w, gc, 0, 0, cast<u32>(WIN_SIZE), cast<u32>(WIN_SIZE));
+
+    y: i32 = 0;
+    while (y < GRID) {
+        x: i32 = 0;
+        while (x < GRID) {
+            v: i32 = cast<i32>(drawn[y * GRID + x]);
+            if (v > 0) {
+                color: u64 = cast<u64>(v) * 65536 + cast<u64>(v) * 256 + cast<u64>(v);
+                XSetForeground(d, gc, color);
+                XFillRectangle(d, w, gc, x * CELL, y * CELL, cast<u32>(CELL), cast<u32>(CELL));
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+
+    XSetForeground(d, gc, 3355443);
+    i: i32 = 0;
+    while (i <= GRID) {
+        XDrawLine(d, w, gc, i * CELL, 0, i * CELL, WIN_SIZE);
+        XDrawLine(d, w, gc, 0, i * CELL, WIN_SIZE, i * CELL);
+        i = i + 1;
+    }
+    XFlush(d);
+}
+
+func draw_window() -> i32 {
+    i: i32 = 0;
+    while (i < 784) { drawn[i] = 0; i = i + 1; }
+
+    d: ptr<Display> = XOpenDisplay(cast<ptr<u8>>(null));
+    if (d == null) {
+        ioPrintln("Error: could not open X display (is DISPLAY set?)");
+        return 0;
+    }
+
+    screen: i32 = XDefaultScreen(d);
+    root: u64 = XRootWindow(d, screen);
+    black: u64 = XBlackPixel(d, screen);
+
+    w: u64 = XCreateSimpleWindow(d, root, 0, 0, cast<u32>(WIN_SIZE), cast<u32>(WIN_SIZE),
+                                  1, black, black);
+    XStoreName(d, w, "CNN Mnist Demo Risk");
+
+    mask: i64 = 1 + 4 + 8 + 64 + 256 + 32768 + 131072;
+    XSelectInput(d, w, mask);
+
+    wm_delete: u64 = XInternAtom(d, "WM_DELETE_WINDOW", 0);
+    XSetWMProtocols(d, w, &wm_delete, 1);
+
+    gc: GC = XCreateGC(d, w, 0, cast<ptr<void>>(null));
+    XMapWindow(d, w);
+
+    drawing_flag: i32 = 0;
+    result: i32 = -1;
+
+    while (result == -1) {
+        ev: XEvent;
+        XNextEvent(d, &ev);
+
+        if (ev.type == EVT_EXPOSE) {
+            redraw(d, w, gc);
+        } else if (ev.type == EVT_BUTTON_PRESS) {
+            bp: ptr<XButtonEvent> = unsafe_cast<ptr<XButtonEvent>>(&ev);
+            drawing_flag = 1;
+            paint((*bp).x / CELL, (*bp).y / CELL);
+            redraw(d, w, gc);
+        } else if (ev.type == EVT_BUTTON_RELEASE) {
+            drawing_flag = 0;
+        } else if (ev.type == EVT_MOTION_NOTIFY) {
+            if (drawing_flag == 1) {
+                mp: ptr<XMotionEvent> = unsafe_cast<ptr<XMotionEvent>>(&ev);
+                paint((*mp).x / CELL, (*mp).y / CELL);
+                redraw(d, w, gc);
+            }
+        } else if (ev.type == EVT_KEY_PRESS) {
+            kp: ptr<XKeyEvent> = unsafe_cast<ptr<XKeyEvent>>(&ev);
+            ks: u64 = XLookupKeysym(kp, 0);
+            if (ks == XK_RETURN || ks == XK_KP_ENTER) {
+                result = 1;
+            } else if (ks == XK_ESCAPE) {
+                result = 0;
+            } else if (ks == XK_C_LOWER || ks == XK_C_UPPER) {
+                i = 0;
+                while (i < 784) { drawn[i] = 0; i = i + 1; }
+                redraw(d, w, gc);
+            }
+        } else if (ev.type == EVT_CLIENT_MESSAGE) {
+            result = 0;
+        }
+    }
+
+    XFreeGC(d, gc);
+    XDestroyWindow(d, w);
+    XCloseDisplay(d);
+    return result;
+}
+
+func main() -> i32 {
+    load_weights("cnn_weights.bin");
+    ioPrintln("Model loaded. A window should have opened -- draw a digit, then press Enter.");
+
+    running: i32 = 1;
+    while (running == 1) {
+        ok: i32 = draw_window();
+        if (ok == 0) {
+            ioPrintln("Window closed. Bye!");
+            running = 0;
+        } else {
+            has_ink: bool = preprocess_digit();
+            if (!has_ink) {
+                ioPrintln("(blank canvas, nothing to predict)");
+            } else {
+                ioPrintln("You drew:");
+                print_grid(&drawn[0]);
+                ioPrintln("After centering/rescaling (what the model actually sees):");
+                print_grid(&preprocessed[0]);
+
+                pred: i32 = predict();
+                ioPrintln("Model prediction: ", pred);
+                j: i32 = 0;
+                while (j < OUTPUT_DIM) {
+                    ioPrintln("  P(", j, ") = ", probs[j]);
+                    j = j + 1;
+                }
+            }
+        }
+    }
+    return 0;
+}
