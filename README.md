@@ -42,3 +42,56 @@ Softmax + cross-entropy loss
 | Epochs | 3 |
 | Pixel scaling | `/ 255` |
  
+## How to run
+
+### Prerequisites
+
+- The `riskc` Risk compiler
+- A BLAS library providing `cblas_sgemm` (e.g. OpenBLAS)
+- X11 (needed only for the interactive inference window)
+
+### 1. Download MNIST
+
+```bash
+./download_mnist.sh
+```
+
+### 2. Compile
+
+```bash
+riskc mnist_cnn_train.risk -o train -O3 -march=native
+riskc mnist_cnn_infer.risk -o infer -O3 -march=native
+```
+
+### 3. Train
+
+```bash
+./train
+```
+
+Training runs for 3 epochs and prints the loss every 200 steps, plus the test accuracy after each epoch. You should see test accuracy of about:
+
+| Epoch | Test accuracy |
+|---|---|
+| 1 | ~97.6% |
+| 2 | ~98.0% |
+| 3 | ~98.2% |
+
+When it finishes, the weights are saved to `cnn_weights.bin`.
+
+### 4. Run inference
+
+```bash
+./infer
+```
+
+An X11 window opens. Draw a digit with the mouse and the model shows its prediction along with the per-class probabilities.
+
+### Quick start
+
+```bash
+./download_mnist.sh
+riskc mnist_cnn_train.risk -o train -O3 -march=native
+riskc mnist_cnn_infer.risk -o infer -O3 -march=native
+./train && ./infer
+```
